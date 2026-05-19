@@ -84,7 +84,7 @@ class ConfigError(Exception):
 # Constants
 # =============================================================================
 OBJECTIVES = {"route_duration", "wait_time"}
-RUN_MODES = {"single_objective", "multi_objective"}
+RUN_MODES = {"single_objective", "multi_objective", "heuristic"}
 OBJ_METHODS = {"augmented_eps", "lexicographic"}
 
 PRODUCT_SET_TO_SHEET = {
@@ -148,6 +148,35 @@ OPTIONAL_CONFIG_DEFAULTS = {
     "C_max_minutes_override": None,    # default: max(c_ij)         used in M16
     "e_min_minutes_override": None,    # default: min(e_p_relative)  used in M22
     "Q_max_override": None,            # default: max(q_k)           used in M24, M25
+
+    # ---- Solomon I1 heuristic parameters (used when run_mode = heuristic) ----
+    # Label only — drives the strict-lex alpha-triple defaults below and
+    # the bias label reported in the result xlsx.
+    "heuristic_objective": "route_duration",  # or "wait_time"
+    "alpha_1": 0.0001,                # weight on Δ-distance in c_1
+    "alpha_2": 1.0,                   # weight on Δ-fleet-route-duration in c_1
+    "alpha_3": 0.01,                  # weight on Δ-fleet-total-wait in c_1
+    "lambda_c2": 1.0,                 # scaling on c(h, o_p) in selection c_2
+    "heuristic_wait_limit": 9999.0,   # epsilon bound on total wait time
+    "apply_2opt": True,               # run 2-opt local search after construction
+    "apply_or_opt": True,             # run Or-opt-on-pairs after 2-opt
+    # Bounded-depth backtracking when greedy reaches infeasible_unrouted.
+    # Empirically n=20 instances need depth >= 15-17; 20 is the safe default.
+    "solomon_backtrack_max_depth": 20,
+    # When backtracking still fails, retry under the other two stock alpha
+    # biases (route_duration / wait_time / balanced).
+    "solomon_multistart": True,
+    # After the 6 stock biases (3 core + 3 extended diverse) all fail,
+    # try this many random alpha-triple restarts (log-uniform in [1e-4,1]^3).
+    "solomon_random_restarts": 20,
+    # After random alpha-restarts also fail, try this many shuffled-order
+    # restarts: each picks a random insertion order over |P| parts and takes
+    # each part's best feasible insertion. Defeats tight single-route
+    # instances where the deterministic greedy creates an irrecoverable
+    # early commitment.
+    "solomon_shuffle_restarts": 100,
+    # Seed for the random alpha-restarts AND shuffled-order restarts.
+    "solomon_random_seed": 42,
 }
 
 
@@ -303,6 +332,48 @@ def load_config(path: Path) -> dict:
         raise ConfigError("shift_duration_min must be > 0")
     if cfg["augmentation_weight"] < 0:
         raise ConfigError("augmentation_weight must be >= 0")
+
+    # ---- Solomon heuristic coercions / validations ----
+    cfg["alpha_1"]   = float(cfg["alpha_1"])
+    cfg["alpha_2"]   = float(cfg["alpha_2"])
+    cfg["alpha_3"]   = float(cfg["alpha_3"])
+    cfg["lambda_c2"] = float(cfg["lambda_c2"])
+    cfg["heuristic_wait_limit"] = float(cfg["heuristic_wait_limit"])
+    cfg["apply_2opt"] = _truthy(cfg["apply_2opt"])
+    cfg["apply_or_opt"] = _truthy(cfg["apply_or_opt"])
+
+    cfg["solomon_backtrack_max_depth"] = int(cfg["solomon_backtrack_max_depth"])
+    if cfg["solomon_backtrack_max_depth"] < 0:
+        raise ConfigError(
+            "solomon_backtrack_max_depth must be >= 0 "
+            f"(got {cfg['solomon_backtrack_max_depth']})"
+        )
+    cfg["solomon_multistart"] = _truthy(cfg["solomon_multistart"])
+    cfg["solomon_random_restarts"] = int(cfg["solomon_random_restarts"])
+    if cfg["solomon_random_restarts"] < 0:
+        raise ConfigError(
+            "solomon_random_restarts must be >= 0 "
+            f"(got {cfg['solomon_random_restarts']})"
+        )
+    cfg["solomon_shuffle_restarts"] = int(cfg["solomon_shuffle_restarts"])
+    if cfg["solomon_shuffle_restarts"] < 0:
+        raise ConfigError(
+            "solomon_shuffle_restarts must be >= 0 "
+            f"(got {cfg['solomon_shuffle_restarts']})"
+        )
+    seed_val = cfg["solomon_random_seed"]
+    if seed_val in (None, "", "none", "None") or (
+            isinstance(seed_val, float) and pd.isna(seed_val)):
+        cfg["solomon_random_seed"] = None
+    else:
+        cfg["solomon_random_seed"] = int(seed_val)
+
+    cfg["heuristic_objective"] = str(cfg["heuristic_objective"]).strip().lower()
+    if cfg["heuristic_objective"] not in {"route_duration", "wait_time"}:
+        raise ConfigError(
+            "heuristic_objective must be 'route_duration' or 'wait_time' "
+            f"(got {cfg['heuristic_objective']!r})"
+        )
 
     return cfg
 
@@ -1988,6 +2059,139 @@ def write_results(m: gp.Model, vars_: dict, inst: Instance,
 
 
 # =============================================================================
+# Heuristic-result reporter (mirrors write_results' sheet layout so the
+# verifier and visualisers can read a Solomon solution exactly as they read a
+# MIP solution).
+# =============================================================================
+def write_heuristic_results(sol, inst: Instance, summary: dict,
+                             *, output_path: Path) -> dict:
+    """Write a `result.xlsx` for a heuristic solution that mirrors the MIP
+    reporter's sheet layout, so all downstream tools (route_timings,
+    verifier, visualisations) can read it the same way."""
+    off = inst.shift_offset
+
+    def stamp(v):
+        return minutes_to_hhmm(v + off) if v is not None and not pd.isna(v) else ""
+
+    summary_row = {
+        "model":                "heuristic_solomon_i1",
+        "status":               summary["status"],
+        "route_duration_min":   summary["route_duration"],
+        "total_wait_min":       summary["total_wait"],
+        "obj_value":            summary["route_duration"],
+        "mip_gap":              float("nan"),
+        "runtime_s":            summary.get("runtime_s", float("nan")),
+        "iterations":           summary["iterations"],
+        "primary_obj":          "route_duration",
+        "constraint_obj":       "wait_time",
+        "limit_on_constraint":  inst.config["heuristic_wait_limit"],
+        "product_set_id":       inst.config["product_set_id"],
+        "num_products":         len(inst.P),
+        "|N|":                  len(inst.N),
+        "|Nw|":                 len(inst.Nw),
+        "|K|":                  len(inst.K),
+        "alpha_1":              inst.config["alpha_1"],
+        "alpha_2":              inst.config["alpha_2"],
+        "lambda_c2":            inst.config["lambda_c2"],
+        "shift_start_clock_min": off,
+        "shift_duration_min":   inst.config["shift_duration_min"],
+    }
+
+    # x_used arcs
+    x_rows = [{"i": i, "j": j, "k": k, "r": r, "val": 1}
+              for (i, j, k, r) in sorted(sol.x_used)]
+    # assignment
+    f_rows = [{"p": p, "k": k, "r": r, "val": 1}
+              for p, (k, r) in sorted(sol.f_assigned.items())]
+    # waits
+    w_rows = [{"p": p, "w": sol.w[p]} for p in sorted(inst.P)]
+    # itinerary in route order
+    itin = []
+    for k in inst.K:
+        for r in inst.routes_of(k):
+            if not sol.z_used.get((k, r), False):
+                continue
+            try:
+                seq = sol.route_order(k, r)
+            except ValueError:
+                continue
+            for order, node in enumerate(seq, start=1):
+                itin.append({
+                    "k": k, "r": r, "order": order, "node": node,
+                    "ta": sol.ta.get((node, k, r), 0.0),
+                    "td": sol.td.get((node, k, r), 0.0),
+                    "ta_clock": stamp(sol.ta.get((node, k, r), 0.0)),
+                    "td_clock": stamp(sol.td.get((node, k, r), 0.0)),
+                    "y_after": sol.y.get((node, k, r), 0.0),
+                })
+
+    # route_timings: one row per arc with depart/arrive/travel + service.
+    timing_rows = []
+    for k in inst.K:
+        for r in inst.routes_of(k):
+            if not sol.z_used.get((k, r), False):
+                continue
+            try:
+                seq = sol.route_order(k, r)
+            except ValueError:
+                continue
+            travel_sum = 0.0
+            service_sum = 0.0
+            for leg, (a, b) in enumerate(zip(seq[:-1], seq[1:]), start=1):
+                depart = sol.td.get((a, k, r), 0.0)
+                arrive = sol.ta.get((b, k, r), 0.0)
+                travel = inst.c.get((a, b), 0.0)
+                load_at_a = sum(inst.s_load[p] for p in inst.P
+                                if inst.o[p] == a and sol.f_assigned.get(p) == (k, r))
+                unload_at_b = sum(inst.s_unload[p] for p in inst.P
+                                  if inst.d[p] == b and sol.f_assigned.get(p) == (k, r))
+                travel_sum += travel
+                service_sum += load_at_a + unload_at_b
+                timing_rows.append({
+                    "vehicle": k, "route": r, "leg": leg,
+                    "from": a, "to": b,
+                    "depart_min": round(depart, 3),
+                    "depart_clock": stamp(depart),
+                    "arrive_min": round(arrive, 3),
+                    "arrive_clock": stamp(arrive),
+                    "travel_min": round(travel, 3),
+                    "load_min_at_from": round(load_at_a, 3),
+                    "unload_min_at_to": round(unload_at_b, 3),
+                })
+            timing_rows.append({
+                "vehicle": k, "route": r, "leg": "TOTAL",
+                "from": "—", "to": "—",
+                "depart_min": "", "depart_clock": "",
+                "arrive_min": "", "arrive_clock": "",
+                "travel_min": round(travel_sum, 3),
+                "load_min_at_from": "", "unload_min_at_to": "",
+            })
+            timing_rows.append({
+                "vehicle": k, "route": r, "leg": "SERVICE",
+                "from": "—", "to": "—",
+                "depart_min": "", "depart_clock": "",
+                "arrive_min": "", "arrive_clock": "",
+                "travel_min": round(service_sum, 3),
+                "load_min_at_from": "", "unload_min_at_to": "",
+            })
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        pd.DataFrame([summary_row]).to_excel(writer, sheet_name="summary", index=False)
+        pd.DataFrame(x_rows).to_excel(writer, sheet_name="x_used", index=False)
+        pd.DataFrame(f_rows).to_excel(writer, sheet_name="assignment_f", index=False)
+        pd.DataFrame(w_rows).to_excel(writer, sheet_name="wait_w", index=False)
+        pd.DataFrame(itin).to_excel(writer, sheet_name="itinerary", index=False)
+        if timing_rows:
+            pd.DataFrame(timing_rows).to_excel(
+                writer, sheet_name="route_timings", index=False
+            )
+
+    log.info("Heuristic results written to %s", output_path)
+    print(f"[run] results -> {output_path}")
+    return summary_row
+
+
+# =============================================================================
 # Post-solve: verify + visualize
 # =============================================================================
 def postprocess(m, vars_, inst, cfg, result_xlsx, run_dir, timestamp: str = ""):
@@ -2264,6 +2468,8 @@ def main() -> int:
     if cfg["run_mode"] == "single_objective":
         label = (f"{cfg['output_prefix']}_{cfg['product_set_id']}"
                  f"_{cfg['primary_obj']}_{timestamp}")
+    elif cfg["run_mode"] == "heuristic":
+        label = (f"heuristic_{cfg['product_set_id']}_{timestamp}")
     else:  # multi_objective
         label = (f"multiobj_{cfg['product_set_id']}"
                  f"_{cfg['primary_obj']}_{timestamp}")
@@ -2331,6 +2537,66 @@ def main() -> int:
                         timestamp=timestamp)
         else:
             print("[run] no feasible solution found")
+        return 0
+
+    if cfg["run_mode"] == "heuristic":
+        from solomon import construct_with_multistart, fleet_to_solution
+        print(f"[run] heuristic mode -> {run_dir}")
+        if cfg.get("solomon_multistart", True):
+            fleet, status, summary = construct_with_multistart(inst, cfg)
+        else:
+            from solomon import construct
+            fleet, status, summary = construct(inst, cfg)
+        # One line per Solomon improvement phase, then the FINAL line.
+        for ph in summary.get("phases", []):
+            extra = ""
+            if "swaps" in ph:
+                extra = f"  swaps={ph['swaps']}"
+            elif "moves" in ph:
+                extra = f"  moves={ph['moves']}"
+            elif "iterations" in ph:
+                extra = f"  iters={ph['iterations']}"
+            print(
+                f"[run] Solomon[{ph['name']:>8}]  "
+                f"f1={ph['f1']:.3f}  f2={ph['f2']:.3f}  "
+                f"runtime={ph['runtime_s']:.4f}s{extra}"
+            )
+        print(
+            f"[run] heuristic FINAL  status={status}  "
+            f"f1={summary['route_duration']:.2f}  "
+            f"f2={summary['total_wait']:.2f}  "
+            f"total_runtime={summary.get('runtime_s', float('nan')):.4f}s"
+        )
+        if status != "feasible":
+            print(f"[run] HEURISTIC INFEASIBLE: unrouted parts "
+                  f"{summary.get('unrouted')}")
+            log.error("Heuristic failed to route all parts: %s",
+                      summary.get("unrouted"))
+            return 3
+
+        # Convert to a Solution and reuse the MIP-side verifier + visualisers.
+        sol = fleet_to_solution(fleet)
+        write_heuristic_results(sol, inst, summary, output_path=result_xlsx)
+
+        # Verifier and visualisations on the heuristic solution.
+        if cfg["auto_verify"]:
+            from verify import validate_solution, format_report
+            findings = validate_solution(sol, inst)
+            report_path = result_xlsx.parent / f"{result_xlsx.stem}.validation.txt"
+            report = format_report(findings)
+            report_path.write_text(report, encoding="utf-8")
+            failed = [f for f in findings if not f.passed]
+            if failed:
+                print(f"[verify] HEURISTIC SOLUTION FAILED — see {report_path}")
+                if cfg["verify_on_fail"] == "raise":
+                    return 4
+            else:
+                print(f"[verify] heuristic solution passed all checks")
+        if cfg["auto_visualize"]:
+            from visualize import render_all
+            paths = render_all(sol, inst, run_dir, suffix=timestamp)
+            for kind, p in paths.items():
+                print(f"[visualize] {kind} -> {p}")
         return 0
 
     # multi_objective mode: adaptive epsilon-constraint sweep.
